@@ -369,6 +369,78 @@ class DockerWorkflowTests(unittest.TestCase):
         push.assert_not_called()
 
 
+class KubernetesManifestTests(unittest.TestCase):
+    def _config(self, replicas=3):
+        config = valid_config()
+        config["container"] = {"image_name": "demo", "image_tag": "v1"}
+        config["deployment"] = {"replicas": replicas}
+        return config
+
+    def test_replicas_are_validated(self):
+        self.assertEqual(app.validate_config(self._config(1)), [])
+        self.assertEqual(app.validate_config(self._config(app.MAX_REPLICAS)), [])
+        for invalid in (0, -1, app.MAX_REPLICAS + 1, True, "2", 1.5, None):
+            with self.subTest(replicas=invalid):
+                errors = app.validate_config(self._config(invalid))
+                self.assertTrue(any("deployment.replicas" in error for error in errors))
+        config = valid_config()
+        config["deployment"] = ["replicas", 2]
+        self.assertTrue(any("'deployment'" in error for error in app.validate_config(config)))
+
+    def test_manifests_use_configured_image_replicas_and_health_probes(self):
+        deployment, service = app.kubernetes_manifests(self._config())
+        pod = deployment["spec"]["template"]["spec"]
+        container = pod["containers"][0]
+        self.assertEqual(deployment["spec"]["replicas"], 3)
+        self.assertEqual(container["image"], "demo:v1")
+        self.assertEqual(container["imagePullPolicy"], "IfNotPresent")
+        self.assertEqual(container["readinessProbe"]["httpGet"]["path"], "/health")
+        self.assertEqual(container["livenessProbe"]["httpGet"]["path"], "/health")
+        self.assertEqual(container["ports"][0]["containerPort"], app.CONTAINER_PORT)
+        self.assertEqual(service["spec"]["selector"], deployment["spec"]["selector"]["matchLabels"])
+        self.assertLessEqual(
+            service["spec"]["selector"].items(), deployment["spec"]["template"]["metadata"]["labels"].items()
+        )
+
+    def test_default_replicas_when_deployment_is_omitted(self):
+        deployment, _ = app.kubernetes_manifests(valid_config())
+        self.assertEqual(deployment["spec"]["replicas"], app.DEFAULT_REPLICAS)
+
+    def test_pods_run_non_root_with_hardened_security_context(self):
+        pod = app.kubernetes_manifests(self._config())[0]["spec"]["template"]["spec"]
+        container = pod["containers"][0]["securityContext"]
+        self.assertTrue(pod["securityContext"]["runAsNonRoot"])
+        self.assertEqual(pod["securityContext"]["runAsUser"], app.CONTAINER_UID)
+        self.assertFalse(pod["automountServiceAccountToken"])
+        self.assertFalse(container["allowPrivilegeEscalation"])
+        self.assertTrue(container["readOnlyRootFilesystem"])
+        self.assertEqual(container["capabilities"]["drop"], ["ALL"])
+
+    def test_container_uid_matches_dockerfile_user(self):
+        dockerfile = (app.PROJECT_ROOT / "app" / "backend" / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn(f"USER {app.CONTAINER_UID}:{app.CONTAINER_UID}", dockerfile)
+
+    def test_invalid_kubernetes_name_is_rejected(self):
+        config = self._config()
+        config["application"]["name"] = "Payment_API"
+        with self.assertRaisesRegex(ValueError, "DNS-1123"):
+            app.kubernetes_manifests(config)
+
+    def test_render_command_writes_manifests_without_cluster_access(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            output_dir = Path(directory) / "kubernetes"
+            with patch.object(app, "KUBERNETES_DIR", output_dir), \
+                    patch.object(app, "load_config", return_value=self._config()), \
+                    patch.object(app.subprocess, "run") as run:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    result = app.main(["render-k8s"])
+            self.assertEqual(result, 0)
+            run.assert_not_called()
+            documents = list(app.yaml.safe_load_all((output_dir / "manifests.yaml").read_text(encoding="utf-8")))
+            self.assertEqual([doc["kind"] for doc in documents], ["Deployment", "Service"])
+            self.assertEqual(documents[0]["spec"]["replicas"], 3)
+
+
 class CiWorkflowTests(unittest.TestCase):
     WORKFLOW = app.PROJECT_ROOT / ".github" / "workflows" / "ci.yml"
 
@@ -390,8 +462,24 @@ class CiWorkflowTests(unittest.TestCase):
         )
         for expected in ("unittest discover", "terraform fmt -check", "terraform validate",
                          "run_nexusops.py build-image", "/health", "sha256sum --check",
-                         "trivy image --exit-code 1", "trivy config --exit-code 1"):
+                         "trivy image --exit-code 1", "trivy config --exit-code 1",
+                         "run_nexusops.py render-k8s", "kind create cluster", "rollout status"):
             self.assertIn(expected, steps)
+
+    def test_ci_kubectl_only_targets_the_ephemeral_kind_cluster(self):
+        workflow = app.yaml.safe_load(self.WORKFLOW.read_text(encoding="utf-8"))
+        job = workflow["jobs"]["kubernetes"]
+        self.assertEqual(job["env"]["KUBE_CONTEXT"], "kind-nexusops")
+        commands = [
+            line.strip()
+            for each in workflow["jobs"].values()
+            for step in each["steps"]
+            for line in step.get("run", "").splitlines()
+            if line.strip().startswith("kubectl ")
+        ]
+        self.assertTrue(commands)
+        for command in commands:
+            self.assertIn('--context "$KUBE_CONTEXT"', command)
 
 
 if __name__ == "__main__":

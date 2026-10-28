@@ -21,6 +21,12 @@ PLAN_FILE = TERRAFORM_DIR / "nexusops.tfplan"
 PLAN_MANIFEST = TERRAFORM_DIR / "nexusops.tfplan.json"
 DEFAULT_BUILD_CONTEXT = "app/backend"
 DEFAULT_DOCKERFILE = "Dockerfile"
+KUBERNETES_DIR = PROJECT_ROOT / "build" / "kubernetes"
+DEFAULT_REPLICAS = 1
+MAX_REPLICAS = 20
+CONTAINER_PORT = 8000
+# Must match the non-root USER in app/backend/Dockerfile.
+CONTAINER_UID = 10001
 
 
 def _is_anchored_path(value):
@@ -154,6 +160,14 @@ def validate_config(config):
         dockerfile = container.get("dockerfile", DEFAULT_DOCKERFILE)
         if not isinstance(dockerfile, str) or not dockerfile.strip() or _is_anchored_path(dockerfile):
             errors.append("'container.dockerfile' must be a relative path inside the build context.")
+
+    deployment = config.get("deployment", {})
+    if not isinstance(deployment, dict):
+        errors.append("'deployment' must be a YAML mapping.")
+    else:
+        replicas = deployment.get("replicas", DEFAULT_REPLICAS)
+        if isinstance(replicas, bool) or not isinstance(replicas, int) or not 1 <= replicas <= MAX_REPLICAS:
+            errors.append(f"'deployment.replicas' must be an integer from 1 to {MAX_REPLICAS}.")
 
     return errors
 
@@ -327,6 +341,90 @@ def build_docker_image(config):
     return image
 
 
+def kubernetes_manifests(config):
+    """Build a Deployment and Service for the configured image without contacting a cluster."""
+    name = config["application"]["name"]
+    if len(name) > 63 or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", name):
+        raise ValueError(
+            "application.name must be a lowercase DNS-1123 label of at most 63 characters "
+            "to render Kubernetes manifests."
+        )
+    replicas = config.get("deployment", {}).get("replicas", DEFAULT_REPLICAS)
+    selector = {"app.kubernetes.io/name": name}
+    labels = {**selector, "app.kubernetes.io/managed-by": "nexusops"}
+
+    def health_probe(initial_delay, period):
+        return {
+            "httpGet": {"path": "/health", "port": "http"},
+            "initialDelaySeconds": initial_delay,
+            "periodSeconds": period,
+            "timeoutSeconds": 2,
+        }
+
+    deployment = {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {"name": name, "labels": labels},
+        "spec": {
+            "replicas": replicas,
+            "selector": {"matchLabels": selector},
+            "template": {
+                "metadata": {"labels": labels},
+                "spec": {
+                    "automountServiceAccountToken": False,
+                    "securityContext": {
+                        "runAsNonRoot": True,
+                        "runAsUser": CONTAINER_UID,
+                        "runAsGroup": CONTAINER_UID,
+                        "seccompProfile": {"type": "RuntimeDefault"},
+                    },
+                    "containers": [{
+                        "name": "app",
+                        "image": docker_image_reference(config),
+                        # A "latest" tag defaults to Always, which cannot use images preloaded into kind.
+                        "imagePullPolicy": "IfNotPresent",
+                        "ports": [{"name": "http", "containerPort": CONTAINER_PORT}],
+                        "readinessProbe": health_probe(2, 5),
+                        "livenessProbe": health_probe(10, 10),
+                        "resources": {
+                            "requests": {"cpu": "50m", "memory": "64Mi"},
+                            "limits": {"cpu": "500m", "memory": "256Mi"},
+                        },
+                        "securityContext": {
+                            "allowPrivilegeEscalation": False,
+                            "readOnlyRootFilesystem": True,
+                            "capabilities": {"drop": ["ALL"]},
+                        },
+                        "volumeMounts": [{"name": "tmp", "mountPath": "/tmp"}],
+                    }],
+                    "volumes": [{"name": "tmp", "emptyDir": {}}],
+                },
+            },
+        },
+    }
+    service = {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {"name": name, "labels": labels},
+        "spec": {
+            "type": "ClusterIP",
+            "selector": selector,
+            "ports": [{"name": "http", "port": 80, "targetPort": "http"}],
+        },
+    }
+    return [deployment, service]
+
+
+def write_kubernetes_manifests(config, output_file=None):
+    """Write rendered manifests; applying them to a cluster is a separate, manual step."""
+    output_file = Path(output_file or KUBERNETES_DIR / "manifests.yaml")
+    documents = kubernetes_manifests(config)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    output_file.write_text(yaml.safe_dump_all(documents, sort_keys=False), encoding="utf-8")
+    print(f"Rendered Kubernetes manifests: {output_file}")
+    return output_file
+
+
 def _run_aws_capture(*arguments):
     """Run AWS CLI and return stdout without logging potentially sensitive output."""
     command = ["aws", *map(str, arguments)]
@@ -397,11 +495,12 @@ def _check_plan_freshness():
 
 def main(argv=None):
     """Run a NexusOps command."""
-    allowed = {"validate", "generate", "plan", "show-plan", "apply", "build-image", "push-ecr"}
+    allowed = {"validate", "generate", "plan", "show-plan", "apply", "build-image", "push-ecr", "render-k8s"}
     args = sys.argv[1:] if argv is None else argv
     command = args[0] if args else "validate"
     if len(args) > 1 or command not in allowed:
-        print("Usage: python run_nexusops.py [validate|generate|plan|show-plan|apply|build-image|push-ecr]")
+        print("Usage: python run_nexusops.py "
+              "[validate|generate|plan|show-plan|apply|build-image|push-ecr|render-k8s]")
         return 2
 
     try:
@@ -415,6 +514,9 @@ def main(argv=None):
         print("NexusOps configuration validation PASSED!")
 
         if command == "validate":
+            return 0
+        if command == "render-k8s":
+            write_kubernetes_manifests(config)
             return 0
         if command == "build-image":
             build_docker_image(config)
