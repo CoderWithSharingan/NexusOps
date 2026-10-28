@@ -389,7 +389,8 @@ class CiWorkflowTests(unittest.TestCase):
             for step in job["steps"]
         )
         for expected in ("unittest discover", "terraform fmt -check", "terraform validate",
-                         "run_nexusops.py build-image", "/health"):
+                         "run_nexusops.py build-image", "/health", "sha256sum --check",
+                         "trivy image --exit-code 1", "trivy config --exit-code 1"):
             self.assertIn(expected, steps)
 
 

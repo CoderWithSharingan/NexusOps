@@ -106,5 +106,8 @@ Tests use temporary files and mocks for Docker, AWS, and Terraform commands. The
 - **Python**: installs `requirements.txt`, compiles sources, runs the unit tests, and runs `validate` and `generate`.
 - **Terraform**: `fmt -check`, `init -backend=false` against the committed lock file, and `validate`.
 - **Docker**: `docker compose config`, `run_nexusops.py build-image`, then runs the container and requires `GET /health` to return `{"status":"ok"}` and Docker's `HEALTHCHECK` to report `healthy`.
+- **Security scanning**: installs Trivy from its release tarball, verified against a SHA-256 pinned in the workflow, then fails the build on fixable HIGH/CRITICAL image vulnerabilities (`trivy image --ignore-unfixed`) and on HIGH/CRITICAL misconfigurations in Terraform, the Dockerfile, and Compose (`trivy config`).
+
+Accepted risks are listed in `.trivyignore` with a reason. Currently the only entry is AWS-0132: the optional S3 bucket uses SSE-S3 (AES256) rather than a customer-managed KMS key, to avoid KMS charges for a demo bucket.
 
 The workflow has read-only repository permissions and uses no secrets or AWS credentials. It never runs `plan`, `apply`, or `push-ecr`; a unit test fails if those operations are added to it.

@@ -1,0 +1,2 @@
+# Accepted risk: the optional demo S3 bucket uses SSE-S3 (AES256) instead of a customer-managed KMS key to avoid KMS charges.
+AWS-0132
