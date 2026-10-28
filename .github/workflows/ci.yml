@@ -60,7 +60,8 @@ jobs:
       - name: Run container and wait for healthy status
         run: |
           docker run --detach --name nexusops-api --publish 8000:8000 payment-api:latest
-          curl --fail --silent --show-error --retry 15 --retry-connrefused --retry-delay 2 \
+          # Docker's port proxy can reset connections before uvicorn listens, so retry on all errors.
+          curl --fail --silent --show-error --retry 15 --retry-all-errors --retry-delay 2 \
             http://127.0.0.1:8000/health | tee health.json
           python -c "import json; assert json.load(open('health.json')) == {'status': 'ok'}"
           for attempt in $(seq 1 30); do

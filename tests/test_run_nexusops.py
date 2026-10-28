@@ -79,8 +79,14 @@ class ConfigValidationTests(unittest.TestCase):
         }
         self.assertTrue(any("image_tag" in error for error in app.validate_config(config)))
         config["container"]["image_tag"] = "latest"
-        config["container"]["build_context"] = "D:/outside"
-        self.assertTrue(any("build_context" in error for error in app.validate_config(config)))
+        for absolute in ("D:/outside", "C:\\outside", "/outside", "\\\\server\\share"):
+            config["container"]["build_context"] = absolute
+            self.assertTrue(any("build_context" in error for error in app.validate_config(config)), absolute)
+            config["container"]["build_context"] = "app/backend"
+            config["container"]["dockerfile"] = absolute
+            self.assertTrue(any("dockerfile" in error for error in app.validate_config(config)), absolute)
+            config["container"]["dockerfile"] = "Dockerfile"
+        self.assertEqual(app.validate_config(config), [])
 
     def test_s3_and_ecr_toggles_are_independent(self):
         config = valid_config()

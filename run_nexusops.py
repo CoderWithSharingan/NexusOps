@@ -5,7 +5,7 @@ import json
 import re
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 try:
     import yaml
@@ -21,6 +21,11 @@ PLAN_FILE = TERRAFORM_DIR / "nexusops.tfplan"
 PLAN_MANIFEST = TERRAFORM_DIR / "nexusops.tfplan.json"
 DEFAULT_BUILD_CONTEXT = "app/backend"
 DEFAULT_DOCKERFILE = "Dockerfile"
+
+
+def _is_anchored_path(value):
+    """Reject absolute paths in both styles so the same YAML validates on Windows and Linux CI."""
+    return bool(PureWindowsPath(value).anchor or PurePosixPath(value).anchor)
 
 
 def load_config(path=CONFIG_FILE):
@@ -143,11 +148,11 @@ def validate_config(config):
             errors.append("'container.image_tag' must be a valid Docker tag of at most 128 characters.")
 
         build_context = container.get("build_context", DEFAULT_BUILD_CONTEXT)
-        if not isinstance(build_context, str) or not build_context.strip() or Path(build_context).is_absolute():
+        if not isinstance(build_context, str) or not build_context.strip() or _is_anchored_path(build_context):
             errors.append("'container.build_context' must be a relative project path.")
 
         dockerfile = container.get("dockerfile", DEFAULT_DOCKERFILE)
-        if not isinstance(dockerfile, str) or not dockerfile.strip() or Path(dockerfile).is_absolute():
+        if not isinstance(dockerfile, str) or not dockerfile.strip() or _is_anchored_path(dockerfile):
             errors.append("'container.dockerfile' must be a relative path inside the build context.")
 
     return errors
