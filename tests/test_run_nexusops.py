@@ -363,5 +363,29 @@ class DockerWorkflowTests(unittest.TestCase):
         push.assert_not_called()
 
 
+class CiWorkflowTests(unittest.TestCase):
+    WORKFLOW = app.PROJECT_ROOT / ".github" / "workflows" / "ci.yml"
+
+    def test_ci_is_read_only_and_never_deploys(self):
+        workflow = app.yaml.safe_load(self.WORKFLOW.read_text(encoding="utf-8"))
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
+        # Inspect parsed content so comments do not count.
+        content = json.dumps(workflow)
+        for forbidden in ("secrets.", "aws-actions/", "push-ecr", "docker push", "docker login",
+                          "terraform apply", "terraform destroy", "run_nexusops.py apply",
+                          "run_nexusops.py plan"):
+            self.assertNotIn(forbidden, content)
+
+    def test_ci_runs_tests_terraform_validation_and_image_build(self):
+        steps = " ".join(
+            step.get("run", "")
+            for job in app.yaml.safe_load(self.WORKFLOW.read_text(encoding="utf-8"))["jobs"].values()
+            for step in job["steps"]
+        )
+        for expected in ("unittest discover", "terraform fmt -check", "terraform validate",
+                         "run_nexusops.py build-image", "/health"):
+            self.assertIn(expected, steps)
+
+
 if __name__ == "__main__":
     unittest.main()

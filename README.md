@@ -98,3 +98,13 @@ The command asks for the exact word `PUSH` before looking up the repository, log
 ```
 
 Tests use temporary files and mocks for Docker, AWS, and Terraform commands. They do not build an image, contact AWS, push an image, or apply infrastructure.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on pushes to `main` and on pull requests:
+
+- **Python**: installs `requirements.txt`, compiles sources, runs the unit tests, and runs `validate` and `generate`.
+- **Terraform**: `fmt -check`, `init -backend=false` against the committed lock file, and `validate`.
+- **Docker**: `docker compose config`, `run_nexusops.py build-image`, then runs the container and requires `GET /health` to return `{"status":"ok"}` and Docker's `HEALTHCHECK` to report `healthy`.
+
+The workflow has read-only repository permissions and uses no secrets or AWS credentials. It never runs `plan`, `apply`, or `push-ecr`; a unit test fails if those operations are added to it.
