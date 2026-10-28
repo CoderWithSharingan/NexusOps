@@ -148,6 +148,13 @@ class PlanFreshnessTests(unittest.TestCase):
                     self.assertIsNotNone(app.plan_freshness_error(), str(file))
                     file.write_text(original, encoding="utf-8")
 
+                for name in ("terraform.tfvars", "extra.auto.tfvars", "extra.auto.tfvars.json"):
+                    added = terraform_dir / name
+                    added.write_text("aws_region = \"us-east-1\"", encoding="utf-8")
+                    self.assertIsNotNone(app.plan_freshness_error(), name)
+                    added.unlink()
+                self.assertIsNone(app.plan_freshness_error())
+
     def test_invalid_manifest_is_rejected(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
             plan = Path(directory) / "plan"

@@ -193,6 +193,9 @@ def _input_fingerprints():
     candidates = [CONFIG_FILE, VARIABLES_FILE]
     candidates.extend(TERRAFORM_DIR.rglob("*.tf"))
     candidates.extend(TERRAFORM_DIR.rglob("*.tf.json"))
+    # Terraform auto-loads terraform.tfvars[.json] and *.auto.tfvars[.json] from the root module.
+    candidates.extend(TERRAFORM_DIR.glob("*.tfvars"))
+    candidates.extend(TERRAFORM_DIR.glob("*.tfvars.json"))
     lock_file = TERRAFORM_DIR / ".terraform.lock.hcl"
     if lock_file.exists():
         candidates.append(lock_file)

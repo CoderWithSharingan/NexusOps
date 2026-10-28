@@ -1,12 +1,12 @@
 # NexusOps
 
-NexusOps is a CLI-first AWS DevOps automation project. It validates YAML, builds a sample FastAPI image locally, generates Terraform variables, and runs Terraform init, validation, and plan. Terraform supports optional S3 buckets and ECR repositories. Publishing an image to an existing ECR repository is a separate, confirmation-gated command. Jenkins, EKS provisioning, and monitoring are future work; their descriptive YAML fields do not currently provision those systems.
+NexusOps is a CLI-first AWS DevOps automation project. It validates YAML, builds a sample FastAPI image locally, generates Terraform variables, and runs Terraform init, validation, and plan. Terraform supports optional S3 buckets and ECR repositories. Publishing an image to an existing ECR repository is a separate, confirmation-gated command. Jenkins, EKS provisioning, Kubernetes deployment, and monitoring are future work; the `infrastructure.provision`, `infrastructure.platform`, `ci_cd`, `deployment`, and `monitoring` YAML fields are descriptive only and are not read by the CLI.
 
 ## Architecture
 
-`run_nexusops.py` reads `nexusops.yaml`. The `build-image` command builds the configured local context and Dockerfile, deriving the image name and tag from the YAML. It never logs in to a registry or pushes an image. `push-ecr` is separate, requires ECR to be enabled, and prompts for the exact word `PUSH` before any registry operation. Terraform uses generated variables in `infrastructure/s3.tf` and `infrastructure/ecr.tf`.
+`run_nexusops.py` is the only CLI entry point. It reads `nexusops.yaml`. The `build-image` command builds the configured local context and Dockerfile, deriving the image name and tag from the YAML. It never logs in to a registry or pushes an image. `push-ecr` is separate, requires ECR to be enabled, and prompts for the exact word `PUSH` before any registry operation. Terraform uses generated variables in `infrastructure/s3.tf` and `infrastructure/ecr.tf`.
 
-The Terraform plan command saves a binary plan plus a freshness manifest. The manifest fingerprints the YAML, generated variables, all Terraform source files (including nested modules), provider lock file, and saved plan. `show-plan` and `apply` reject missing or stale plans. `apply` displays the exact saved plan before asking for the exact word `APPLY` and checks freshness again after the prompt.
+The Terraform plan command saves a binary plan plus a freshness manifest. The manifest fingerprints the YAML, generated variables, any other `*.tfvars`/`*.tfvars.json` files in `infrastructure/` (Terraform auto-loads `terraform.tfvars` and `*.auto.tfvars`), all Terraform source files (including nested modules), provider lock file, and saved plan. `show-plan` and `apply` reject missing or stale plans. `apply` displays the exact saved plan before asking for the exact word `APPLY` and checks freshness again after the prompt.
 
 ## Requirements and setup on Windows
 
@@ -52,7 +52,7 @@ resources:
     scan_on_push: true
 ```
 
-`container.image_name` is optional and defaults to `application.name`. The image tag defaults to `latest`. Build context paths are relative to the project, and the Dockerfile path is relative to the build context. S3 and ECR are independent. ECR supports `enabled`, `repository_name`, `image_tag_mutability` (`IMMUTABLE` or `MUTABLE`), and `scan_on_push`. ECR uses AES256 encryption and `force_delete = false`; with `enabled: false`, Terraform sets the repository count to zero.
+`container.image_name` is optional and defaults to `application.name`. The image tag defaults to `latest`. Build context paths are relative to the project, and the Dockerfile path is relative to the build context. S3 and ECR are independent. ECR supports `enabled`, `repository_name`, `image_tag_mutability` (`IMMUTABLE` or `MUTABLE`), and `scan_on_push`. ECR uses AES256 encryption and `force_delete = false`; with `enabled: false`, Terraform sets the repository count to zero. When S3 is enabled, the bucket also gets a full public access block, `BucketOwnerEnforced` object ownership (ACLs disabled), and AES256 default encryption, so a plan for the sample config proposes 4 resources.
 
 ## Build and run the sample API
 
