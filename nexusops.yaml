@@ -1,0 +1,39 @@
+
+application:
+  name: payment-api
+  language: python
+  framework: fastapi
+
+infrastructure:
+  provider: aws
+  region: ap-south-1
+  provision: true
+  platform: eks
+
+container:
+  tool: docker
+  registry: ecr
+  build_context: app/backend
+  dockerfile: Dockerfile
+  image_tag: latest
+
+ci_cd:
+  tool: jenkins
+  run_tests: true
+
+deployment:
+  replicas: 2
+
+monitoring:
+  enabled: true
+  tool: prometheus
+
+resources:
+  s3:
+    enabled: true
+    bucket_name: nexusops-payment-api-hnair-demo-171026
+  ecr:
+    enabled: false
+    repository_name: payment-api
+    image_tag_mutability: IMMUTABLE
+    scan_on_push: true

@@ -1,0 +1,25 @@
+# Terraform working data and local plans can contain sensitive infrastructure details.
+**/.terraform/
+**/*.tfstate
+**/*.tfstate.*
+**/*.tfplan
+**/*.tfplan.json
+**/*.tfvars
+**/*.tfvars.json
+**/.aws/
+**/.env
+**/.env.*
+!**/.env.example
+**/credentials
+**/credentials.*
+**/*.pem
+**/*.key
+crash.log
+crash.*.log
+
+# Python bytecode and test caches.
+.venv/
+.tmp/
+__pycache__/
+*.py[cod]
+.pytest_cache/
