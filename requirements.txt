@@ -1,2 +1,4 @@
 PyYAML==6.0.3
+ruamel.yaml==0.18.10
+httpx==0.28.1
 -r app/backend/requirements.txt
