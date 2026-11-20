@@ -24,7 +24,7 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: python -m pip install -r requirements.txt
-      - run: python -m compileall -q run_nexusops.py app tests
+      - run: python -m compileall -q run_nexusops.py app webui tests
       - run: python -m unittest discover -s tests -v
       - run: python run_nexusops.py validate
       - run: python run_nexusops.py generate
@@ -44,6 +44,24 @@ jobs:
       - run: terraform fmt -check -recursive -diff
       - run: terraform init -backend=false -input=false -lockfile=readonly
       - run: terraform validate
+
+  webui:
+    name: Web UI tests and build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: webui/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: webui/frontend/package-lock.json
+      - run: npm ci
+      - run: npm run check:models
+      - run: npm test
+      - run: npm run build
 
   docker:
     name: Docker build and health check

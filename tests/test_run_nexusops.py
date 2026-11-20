@@ -57,6 +57,7 @@ class ConfigValidationTests(unittest.TestCase):
     def test_ecr_valid_and_invalid_settings(self):
         config = valid_config()
         config["resources"]["ecr"].update(enabled=True)
+        config["container"] = {"image_tag": "v1"}
         self.assertEqual(app.validate_config(config), [])
         for key, value in (
             ("repository_name", ""),
@@ -172,7 +173,7 @@ class PlanFreshnessTests(unittest.TestCase):
 
 class CliTests(unittest.TestCase):
     def test_unknown_or_extra_commands_return_usage_error(self):
-        self.assertEqual(app.main(["destroy"]), 2)
+        self.assertEqual(app.main(["teardown"]), 2)
         self.assertEqual(app.main(["validate", "extra"]), 2)
 
     def _patch_temp_project(self, directory):
@@ -188,6 +189,8 @@ class CliTests(unittest.TestCase):
         values = {
             "PROJECT_ROOT": root, "TERRAFORM_DIR": terraform_dir, "CONFIG_FILE": config_path,
             "VARIABLES_FILE": variables, "PLAN_FILE": plan, "PLAN_MANIFEST": manifest,
+            "BACKEND_FILE": terraform_dir / "backend.tf.json",
+            "DESTROY_PLAN_FILE": terraform_dir / "nexusops-destroy.tfplan",
         }
         return root, terraform_dir, variables, plan, manifest, values
 
@@ -275,7 +278,7 @@ class DockerWorkflowTests(unittest.TestCase):
             with patch.object(app, "PROJECT_ROOT", root), patch.object(app, "run_docker") as docker:
                 image = app.build_docker_image(config)
             self.assertEqual(image, "demo:dev-1")
-            docker.assert_called_once_with("build", "--file", dockerfile, "--tag", "demo:dev-1", context)
+            docker.assert_called_once_with("build", "--file", dockerfile, "--tag", "demo:dev-1", context, stream=True)
 
     def test_compose_uses_backend_build_context_and_health_endpoint(self):
         compose = app.yaml.safe_load((app.PROJECT_ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
@@ -326,7 +329,7 @@ class DockerWorkflowTests(unittest.TestCase):
         ))
         self.assertEqual(docker_login.call_args.kwargs["input"], "secret-token")
         self.assertNotIn("secret-token", str(docker_login.call_args.args))
-        self.assertEqual(docker.call_args_list[0].args, ("image", "inspect", "demo:dev-1"))
+        self.assertEqual(docker.call_args_list[0].args, ("image", "inspect", "--format", "{{.Id}}", "demo:dev-1"))
         self.assertEqual(docker.call_args_list[1].args, ("tag", "demo:dev-1", pushed))
         self.assertEqual(docker.call_args_list[2].args, ("push", pushed))
 
@@ -441,6 +444,198 @@ class KubernetesManifestTests(unittest.TestCase):
             self.assertEqual(documents[0]["spec"]["replicas"], 3)
 
 
+class ImmutableTagTests(unittest.TestCase):
+    def _config(self, tag=None, mutability="IMMUTABLE", enabled=True):
+        config = valid_config()
+        config["resources"]["ecr"].update(enabled=enabled, image_tag_mutability=mutability)
+        if tag is not None:
+            config["container"] = {"image_tag": tag}
+        return config
+
+    def test_latest_is_rejected_with_immutable_ecr(self):
+        for config in (self._config(), self._config("latest")):
+            self.assertTrue(any("cannot be 'latest'" in error for error in app.validate_config(config)))
+
+    def test_latest_is_allowed_when_push_cannot_conflict(self):
+        self.assertEqual(app.validate_config(self._config("latest", mutability="MUTABLE")), [])
+        self.assertEqual(app.validate_config(self._config("latest", enabled=False)), [])
+        self.assertEqual(app.validate_config(self._config("v1.2.0")), [])
+
+
+class DeploymentImageTests(unittest.TestCase):
+    def _config(self, image):
+        config = valid_config()
+        config["deployment"] = {"replicas": 1, "image": image}
+        return config
+
+    def test_registry_image_is_used_in_manifests(self):
+        image = "123456789012.dkr.ecr.ap-south-1.amazonaws.com/demo/repo:v1"
+        config = self._config(image)
+        self.assertEqual(app.validate_config(config), [])
+        deployment, _ = app.kubernetes_manifests(config)
+        self.assertEqual(deployment["spec"]["template"]["spec"]["containers"][0]["image"], image)
+
+    def test_empty_image_falls_back_to_local_name(self):
+        config = self._config("")
+        self.assertEqual(app.validate_config(config), [])
+        deployment, _ = app.kubernetes_manifests(config)
+        self.assertEqual(deployment["spec"]["template"]["spec"]["containers"][0]["image"], "demo:latest")
+
+    def test_valid_and_invalid_references(self):
+        for image in ("demo:v1", "localhost:5000/team/app:1.0", "repo/app@sha256:" + "a" * 64):
+            self.assertEqual(app.validate_config(self._config(image)), [], image)
+        for image in ("demo", "Demo:v1", "demo:", "demo:v1 ; rm", 5, ["demo:v1"]):
+            errors = app.validate_config(self._config(image))
+            self.assertTrue(any("deployment.image" in error for error in errors), image)
+
+    def test_render_warns_when_ecr_is_on_without_cluster_image(self):
+        config = valid_config()
+        config["resources"]["ecr"]["enabled"] = True
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                app.write_kubernetes_manifests(config, Path(directory) / "manifests.yaml")
+        self.assertIn("deployment.image", output.getvalue())
+
+
+class BackendTests(unittest.TestCase):
+    def _config(self, backend):
+        config = valid_config()
+        config["terraform"] = {"backend": backend}
+        return config
+
+    def test_backend_settings_are_validated(self):
+        valid = {"bucket": "my-state-bucket", "key": "nexusops/demo.tfstate"}
+        self.assertEqual(app.validate_config(self._config(valid)), [])
+        self.assertEqual(app.validate_config(self._config({**valid, "region": "us-east-1", "use_lockfile": False})), [])
+        for invalid in (
+            {**valid, "bucket": "Bad_Bucket"}, {**valid, "key": ""}, {**valid, "key": "/abs"},
+            {**valid, "region": "nowhere"}, {**valid, "use_lockfile": "yes"}, {**valid, "dynamodb": "t"},
+            {"key": "k"}, "s3",
+        ):
+            self.assertTrue(app.validate_config(self._config(invalid)), invalid)
+        config = valid_config()
+        config["terraform"] = {"workspace": "dev"}
+        self.assertTrue(any("Unsupported 'terraform'" in error for error in app.validate_config(config)))
+
+    def test_backend_file_is_written_and_removed(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            output = Path(directory) / "backend.tf.json"
+            with contextlib.redirect_stdout(io.StringIO()):
+                app.write_backend_config(self._config({"bucket": "my-state-bucket", "key": "demo.tfstate"}), output)
+                settings = json.loads(output.read_text(encoding="utf-8"))["terraform"]["backend"]["s3"]
+                self.assertEqual(settings, {
+                    "bucket": "my-state-bucket", "key": "demo.tfstate", "region": "ap-south-1",
+                    "encrypt": True, "use_lockfile": True,
+                })
+                app.write_backend_config(valid_config(), output)
+            self.assertFalse(output.exists())
+
+    def test_backend_change_makes_saved_plan_stale(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            _, terraform_dir, _, plan, _, constants = CliTests._patch_temp_project(None, directory)
+            plan.write_bytes(b"plan")
+            with patch.multiple(app, **constants), contextlib.redirect_stdout(io.StringIO()):
+                app._write_plan_manifest()
+                self.assertIsNone(app.plan_freshness_error())
+                app.write_backend_config(self._config({"bucket": "my-state-bucket", "key": "demo.tfstate"}))
+                self.assertIsNotNone(app.plan_freshness_error())
+
+
+class DestroyTests(unittest.TestCase):
+    def _run(self, answer, change_inputs=False):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            _, terraform_dir, _, plan, manifest, constants = CliTests._patch_temp_project(None, directory)
+            destroy_plan = constants["DESTROY_PLAN_FILE"]
+            plan.write_bytes(b"old plan")
+            manifest.write_text("{}", encoding="utf-8")
+            calls = []
+
+            def fake_terraform(*args):
+                calls.append(args)
+                if args[0] == "plan":
+                    destroy_plan.write_bytes(b"destroy plan")
+
+            def fake_input(_prompt):
+                if change_inputs:
+                    (terraform_dir / "main.tf").write_text("changed", encoding="utf-8")
+                if isinstance(answer, type) and issubclass(answer, BaseException):
+                    raise answer
+                return answer
+
+            with patch.multiple(app, **constants), patch.object(app, "load_config", return_value=valid_config()), \
+                    patch.object(app, "run_terraform", side_effect=fake_terraform), \
+                    patch("builtins.input", side_effect=fake_input):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    result = app.main(["destroy"])
+            return result, calls, destroy_plan.exists(), manifest.exists()
+
+    def test_destroy_shows_plan_and_cancels_without_applying(self):
+        result, calls, leftover, _ = self._run("no")
+        self.assertEqual(result, 0)
+        self.assertEqual([call[0] for call in calls], ["init", "plan", "show"])
+        self.assertIn("-destroy", calls[1])
+        self.assertFalse(leftover)
+
+    def test_destroy_without_confirmation_input_is_cancelled(self):
+        result, calls, _, _ = self._run(EOFError)
+        self.assertEqual(result, 1)
+        self.assertNotIn("apply", [call[0] for call in calls])
+
+    def test_confirmed_destroy_applies_the_saved_destroy_plan(self):
+        result, calls, leftover, manifest_left = self._run("DESTROY")
+        self.assertEqual(result, 0)
+        self.assertEqual(calls[-1][0], "apply")
+        self.assertTrue(str(calls[-1][-1]).endswith("nexusops-destroy.tfplan"))
+        self.assertFalse(leftover)
+        self.assertFalse(manifest_left)
+
+    def test_destroy_rejects_inputs_changed_during_confirmation(self):
+        result, calls, _, _ = self._run("DESTROY", change_inputs=True)
+        self.assertEqual(result, 1)
+        self.assertNotIn("apply", [call[0] for call in calls])
+
+
+class StreamingDockerTests(unittest.TestCase):
+    def test_streamed_commands_are_not_captured(self):
+        done = subprocess.CompletedProcess([], 0)
+        with patch.object(app.subprocess, "run", return_value=done) as run:
+            with contextlib.redirect_stdout(io.StringIO()):
+                app.run_docker("build", ".", stream=True)
+        self.assertNotIn("capture_output", run.call_args.kwargs)
+
+    def test_streamed_failure_is_reported(self):
+        failed = subprocess.CompletedProcess([], 3)
+        with patch.object(app.subprocess, "run", return_value=failed):
+            with contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(RuntimeError, "exit code 3"):
+                    app.run_docker("push", "x:1", stream=True)
+
+
+class SaveConfigTests(unittest.TestCase):
+    def test_comments_are_kept_and_changes_applied(self):
+        original = (
+            "# Project settings\n"
+            "application:\n  name: demo  # used for images\n"
+            "infrastructure:\n  provider: aws\n  region: ap-south-1\n"
+            "deployment:\n  replicas: 1  # copies\n"
+            "monitoring:\n  enabled: true\n"
+        )
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            path = Path(directory) / "nexusops.yaml"
+            path.write_text(original, encoding="utf-8")
+            config = app.load_config(path)
+            config["deployment"]["replicas"] = 4
+            del config["monitoring"]
+            self.assertEqual(app.save_config(config, path), [])
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("# Project settings", text)
+            self.assertIn("# used for images", text)
+            self.assertNotIn("monitoring", text)
+            self.assertEqual(app.load_config(path), config)
+            self.assertEqual(path.with_name("nexusops.yaml.bak").read_text(encoding="utf-8"), original)
+
+
 class CiWorkflowTests(unittest.TestCase):
     WORKFLOW = app.PROJECT_ROOT / ".github" / "workflows" / "ci.yml"
 
@@ -451,7 +646,7 @@ class CiWorkflowTests(unittest.TestCase):
         content = json.dumps(workflow)
         for forbidden in ("secrets.", "aws-actions/", "push-ecr", "docker push", "docker login",
                           "terraform apply", "terraform destroy", "run_nexusops.py apply",
-                          "run_nexusops.py plan"):
+                          "run_nexusops.py plan", "run_nexusops.py destroy"):
             self.assertNotIn(forbidden, content)
 
     def test_ci_runs_tests_terraform_validation_and_image_build(self):

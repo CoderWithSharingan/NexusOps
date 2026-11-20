@@ -1,8 +1,11 @@
 """NexusOps configuration and guarded Terraform workflow."""
 
 import hashlib
+import io
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -27,6 +30,15 @@ MAX_REPLICAS = 20
 CONTAINER_PORT = 8000
 # Must match the non-root USER in app/backend/Dockerfile.
 CONTAINER_UID = 10001
+# Generated from nexusops.yaml when terraform.backend is set; removed otherwise.
+BACKEND_FILE = TERRAFORM_DIR / "backend.tf.json"
+DESTROY_PLAN_FILE = TERRAFORM_DIR / "nexusops-destroy.tfplan"
+_NAME_COMPONENT = r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
+# registry[:port]/path[:tag][@sha256:digest], requiring a tag or a digest so "latest" is never implied.
+IMAGE_REFERENCE = re.compile(
+    rf"(?:[A-Za-z0-9.-]+(?::[0-9]+)?/)?{_NAME_COMPONENT}(?:/{_NAME_COMPONENT})*"
+    r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}(?:@sha256:[a-f0-9]{64})?|@sha256:[a-f0-9]{64})"
+)
 
 
 def _is_anchored_path(value):
@@ -34,7 +46,7 @@ def _is_anchored_path(value):
     return bool(PureWindowsPath(value).anchor or PurePosixPath(value).anchor)
 
 
-def load_config(path=CONFIG_FILE):
+def load_config(path=None):
     """Load the NexusOps YAML configuration as a mapping."""
     if yaml is None:
         raise ValueError(
@@ -42,7 +54,7 @@ def load_config(path=CONFIG_FILE):
             "'python -m pip install -r requirements.txt'."
         )
     try:
-        with Path(path).open("r", encoding="utf-8") as file:
+        with Path(path or CONFIG_FILE).open("r", encoding="utf-8") as file:
             config = yaml.safe_load(file)
     except yaml.YAMLError as error:
         raise ValueError(f"Invalid YAML syntax: {error}") from error
@@ -52,6 +64,58 @@ def load_config(path=CONFIG_FILE):
     if not isinstance(config, dict):
         raise ValueError("Configuration must be a YAML mapping.")
     return config
+
+
+def save_config(config, path=None):
+    """Write configuration only if it validates; return validation errors otherwise."""
+    if yaml is None:
+        raise ValueError("PyYAML is required to save the configuration.")
+    errors = validate_config(config)
+    if errors:
+        return errors
+    path = Path(path or CONFIG_FILE)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(_dump_preserving_comments(path, config), encoding="utf-8")
+    if path.exists():
+        shutil.copy2(path, path.with_name(path.name + ".bak"))
+    os.replace(temporary, path)
+    return []
+
+
+def _merge_into(target, source):
+    """Update a round-trip mapping in place so unchanged keys keep their comments and layout."""
+    for key in [each for each in target if each not in source]:
+        del target[key]
+    for key, value in source.items():
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            _merge_into(target[key], value)
+        elif key not in target or target[key] != value or type(target[key]) is not type(value):
+            target[key] = value
+
+
+def _dump_preserving_comments(path, config):
+    """Serialize config, keeping comments from the existing file when ruamel.yaml is available."""
+    try:
+        from ruamel.yaml import YAML
+        from ruamel.yaml.error import YAMLError as RoundTripError
+    except ModuleNotFoundError:
+        return yaml.safe_dump(config, sort_keys=False, allow_unicode=True)
+    round_trip = YAML()
+    round_trip.preserve_quotes = True
+    round_trip.width = 4096
+    document = None
+    if path.is_file():
+        try:
+            document = round_trip.load(path.read_text(encoding="utf-8"))
+        except (RoundTripError, OSError, ValueError):
+            document = None
+    if isinstance(document, dict):
+        _merge_into(document, config)
+    else:
+        document = config
+    stream = io.StringIO()
+    round_trip.dump(document, stream)
+    return stream.getvalue()
 
 
 def validate_config(config):
@@ -89,12 +153,7 @@ def validate_config(config):
                 name = s3.get("bucket_name")
                 if not isinstance(name, str) or not name.strip():
                     errors.append("A bucket_name is required when S3 is enabled.")
-                elif (
-                    not 3 <= len(name) <= 63
-                    or not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", name)
-                    or ".." in name
-                    or re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", name)
-                ):
+                elif not _is_bucket_name(name):
                     errors.append("S3 bucket_name must be 3-63 lowercase letters, digits, dots, or hyphens.")
 
         ecr = resources.get("ecr", {})
@@ -152,6 +211,14 @@ def validate_config(config):
             r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", image_tag
         ):
             errors.append("'container.image_tag' must be a valid Docker tag of at most 128 characters.")
+        elif image_tag == "latest" and _ecr_settings(config).get("enabled") is True \
+                and _ecr_settings(config).get("image_tag_mutability", "IMMUTABLE") == "IMMUTABLE":
+            # ECR rejects a second push of an existing tag when tags are immutable.
+            errors.append(
+                "'container.image_tag' cannot be 'latest' while ECR uses IMMUTABLE tags, because the "
+                "second push would be rejected. Use a unique tag such as a version or commit SHA, "
+                "or set resources.ecr.image_tag_mutability to MUTABLE."
+            )
 
         build_context = container.get("build_context", DEFAULT_BUILD_CONTEXT)
         if not isinstance(build_context, str) or not build_context.strip() or _is_anchored_path(build_context):
@@ -168,8 +235,58 @@ def validate_config(config):
         replicas = deployment.get("replicas", DEFAULT_REPLICAS)
         if isinstance(replicas, bool) or not isinstance(replicas, int) or not 1 <= replicas <= MAX_REPLICAS:
             errors.append(f"'deployment.replicas' must be an integer from 1 to {MAX_REPLICAS}.")
+        image = deployment.get("image")
+        if image not in (None, "") and (not isinstance(image, str) or not IMAGE_REFERENCE.fullmatch(image)):
+            errors.append(
+                "'deployment.image' must be a full image reference with a tag or digest, for example "
+                "123456789012.dkr.ecr.ap-south-1.amazonaws.com/payment-api:v1."
+            )
 
+    errors.extend(_backend_errors(config.get("terraform", {})))
     return errors
+
+
+def _is_bucket_name(name):
+    return (
+        3 <= len(name) <= 63
+        and re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", name) is not None
+        and ".." not in name
+        and re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", name) is None
+    )
+
+
+def _backend_errors(terraform):
+    """Validate the optional S3 remote state backend under terraform.backend."""
+    if not isinstance(terraform, dict):
+        return ["'terraform' must be a YAML mapping."]
+    errors = [f"Unsupported 'terraform' option: {key}." for key in sorted(set(terraform) - {"backend"})]
+    backend = terraform.get("backend")
+    if backend is None:
+        return errors
+    if not isinstance(backend, dict):
+        return errors + ["'terraform.backend' must be a YAML mapping."]
+    errors += [
+        f"Unsupported 'terraform.backend' option: {key}."
+        for key in sorted(set(backend) - {"bucket", "key", "region", "use_lockfile"})
+    ]
+    bucket = backend.get("bucket")
+    if not isinstance(bucket, str) or not _is_bucket_name(bucket):
+        errors.append("'terraform.backend.bucket' must be an existing S3 bucket name for Terraform state.")
+    key = backend.get("key")
+    if not isinstance(key, str) or not key.strip() or key.startswith("/") or len(key) > 1024:
+        errors.append("'terraform.backend.key' must be a relative object key such as nexusops/terraform.tfstate.")
+    region = backend.get("region")
+    if region is not None and (not isinstance(region, str) or not re.fullmatch(r"[a-z]{2}(?:-[a-z]+)+-\d+", region)):
+        errors.append("'terraform.backend.region' must be an AWS region such as ap-south-1.")
+    if not isinstance(backend.get("use_lockfile", True), bool):
+        errors.append("'terraform.backend.use_lockfile' must be true or false.")
+    return errors
+
+
+def _ecr_settings(config):
+    resources = config.get("resources")
+    ecr = resources.get("ecr") if isinstance(resources, dict) else None
+    return ecr if isinstance(ecr, dict) else {}
 
 
 def terraform_variables(config):
@@ -197,6 +314,33 @@ def generate_terraform_variables(config, output_file=None):
     output_file.parent.mkdir(parents=True, exist_ok=True)
     output_file.write_text(json.dumps(variables, indent=2) + "\n", encoding="utf-8")
     print(f"Generated Terraform variables: {output_file}")
+
+
+def write_backend_config(config, output_file=None):
+    """Write the S3 state backend from terraform.backend, or remove it so state stays local."""
+    output_file = Path(output_file or BACKEND_FILE)
+    backend = config.get("terraform", {}).get("backend")
+    if not backend:
+        if output_file.exists():
+            output_file.unlink()
+            print(f"Removed {output_file.name}; Terraform state is local. "
+                  "Run 'terraform init -migrate-state' in infrastructure/ to move existing state.")
+        return None
+    settings = {
+        "bucket": backend["bucket"],
+        "key": backend["key"],
+        "region": backend.get("region") or config["infrastructure"]["region"],
+        "encrypt": True,
+        "use_lockfile": backend.get("use_lockfile", True),
+    }
+    document = {"terraform": {"backend": {"s3": settings}}}
+    text = json.dumps(document, indent=2) + "\n"
+    if output_file.is_file() and output_file.read_text(encoding="utf-8") == text:
+        return output_file
+    output_file.write_text(text, encoding="utf-8")
+    print(f"Generated Terraform S3 backend: {output_file} (s3://{settings['bucket']}/{settings['key']}). "
+          "If state already exists elsewhere, run 'terraform init -migrate-state' in infrastructure/.")
+    return output_file
 
 
 def _sha256(path):
@@ -275,6 +419,25 @@ def run_terraform(*arguments):
         raise RuntimeError(f"Terraform command failed with exit code {result.returncode}.")
 
 
+def saved_plan_text():
+    """Return the saved plan as plain text; refuses missing or stale plans."""
+    error = plan_freshness_error()
+    if error:
+        raise ValueError(error)
+    command = ["terraform", f"-chdir={TERRAFORM_DIR}", "show", "-no-color", str(PLAN_FILE)]
+    try:
+        result = subprocess.run(
+            command, cwd=PROJECT_ROOT, check=False, capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+    except OSError as error:
+        raise RuntimeError(f"Could not start Terraform: {error}") from error
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip()
+        raise RuntimeError(f"Terraform show failed with exit code {result.returncode}. {detail}".strip())
+    return result.stdout
+
+
 def docker_image_reference(config):
     """Return the configured local image name and tag."""
     container = config.get("container", {})
@@ -306,17 +469,27 @@ def _docker_build_arguments(config):
     return ["build", "--file", dockerfile, "--tag", docker_image_reference(config), context]
 
 
-def run_docker(*arguments):
-    """Run Docker and report missing CLI or build/push failures clearly."""
+def run_docker(*arguments, stream=False):
+    """Run Docker and report missing CLI or build/push failures clearly.
+
+    With stream=True, output goes straight to the terminal so long builds and pushes show progress.
+    """
     command = ["docker", *map(str, arguments)]
-    print(f"\n> {' '.join(command)}")
+    print(f"\n> {' '.join(command)}", flush=True)
     try:
-        result = subprocess.run(
-            command, cwd=PROJECT_ROOT, check=False, capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-        )
+        if stream:
+            result = subprocess.run(command, cwd=PROJECT_ROOT, check=False)
+        else:
+            result = subprocess.run(
+                command, cwd=PROJECT_ROOT, check=False, capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+            )
     except OSError as error:
         raise RuntimeError(f"Could not start Docker. Install Docker Desktop and ensure docker is on PATH: {error}") from error
+    if stream:
+        if result.returncode != 0:
+            raise RuntimeError(f"Docker command failed with exit code {result.returncode}. See the output above.")
+        return
     output = (result.stdout or "").strip()
     detail = (result.stderr or "").strip()
     if output:
@@ -335,7 +508,7 @@ def run_docker(*arguments):
 def build_docker_image(config):
     """Build a local image; this does not authenticate to or push to a registry."""
     arguments = _docker_build_arguments(config)
-    run_docker(*arguments)
+    run_docker(*arguments, stream=True)
     image = docker_image_reference(config)
     print(f"Docker image built locally: {image}")
     return image
@@ -349,7 +522,10 @@ def kubernetes_manifests(config):
             "application.name must be a lowercase DNS-1123 label of at most 63 characters "
             "to render Kubernetes manifests."
         )
-    replicas = config.get("deployment", {}).get("replicas", DEFAULT_REPLICAS)
+    deployment_settings = config.get("deployment", {})
+    replicas = deployment_settings.get("replicas", DEFAULT_REPLICAS)
+    # deployment.image points real clusters at a registry (for example ECR); the local name suits kind.
+    image = deployment_settings.get("image") or docker_image_reference(config)
     selector = {"app.kubernetes.io/name": name}
     labels = {**selector, "app.kubernetes.io/managed-by": "nexusops"}
 
@@ -380,7 +556,7 @@ def kubernetes_manifests(config):
                     },
                     "containers": [{
                         "name": "app",
-                        "image": docker_image_reference(config),
+                        "image": image,
                         # A "latest" tag defaults to Always, which cannot use images preloaded into kind.
                         "imagePullPolicy": "IfNotPresent",
                         "ports": [{"name": "http", "containerPort": CONTAINER_PORT}],
@@ -422,6 +598,9 @@ def write_kubernetes_manifests(config, output_file=None):
     output_file.parent.mkdir(parents=True, exist_ok=True)
     output_file.write_text(yaml.safe_dump_all(documents, sort_keys=False), encoding="utf-8")
     print(f"Rendered Kubernetes manifests: {output_file}")
+    if _ecr_settings(config).get("enabled") is True and not config.get("deployment", {}).get("image"):
+        print("NOTE: The manifests use the local image name, which only works on clusters that already "
+              "have it (such as kind). Set deployment.image to the ECR image URI for a real cluster.")
     return output_file
 
 
@@ -454,7 +633,7 @@ def push_ecr_image(config, *, confirmed=False):
     repository_name = ecr["repository_name"]
     region = config["infrastructure"]["region"]
     image = docker_image_reference(config)
-    run_docker("image", "inspect", image)
+    run_docker("image", "inspect", "--format", "{{.Id}}", image)
     repository_uri = _run_aws_capture(
         "ecr", "describe-repositories", "--repository-names", repository_name,
         "--region", region, "--query", "repositories[0].repositoryUri", "--output", "text",
@@ -480,9 +659,39 @@ def push_ecr_image(config, *, confirmed=False):
 
     remote_image = f"{repository_uri}:{config.get('container', {}).get('image_tag', 'latest')}"
     run_docker("tag", image, remote_image)
-    run_docker("push", remote_image)
+    run_docker("push", remote_image, stream=True)
     print(f"Pushed Docker image to ECR: {remote_image}")
     return remote_image
+
+
+def _destroy():
+    """Plan a destroy, show it, require DESTROY, then apply exactly that saved destroy plan."""
+    DESTROY_PLAN_FILE.unlink(missing_ok=True)
+    try:
+        run_terraform("init", "-input=false")
+        run_terraform("plan", "-destroy", "-input=false", "-out", DESTROY_PLAN_FILE)
+        snapshot = (_sha256(DESTROY_PLAN_FILE), _input_fingerprints())
+        run_terraform("show", DESTROY_PLAN_FILE)
+        print("\nWARNING: This permanently deletes the AWS resources listed above.")
+        print("A non-empty S3 bucket or ECR repository will make the destroy fail rather than delete data.")
+        try:
+            confirmation = input("Type DESTROY to delete these resources, or anything else to cancel: ")
+        except EOFError:
+            print("Destroy cancelled because no confirmation was received.")
+            return 1
+        if confirmation != "DESTROY":
+            print("Destroy cancelled. No infrastructure was changed.")
+            return 0
+        if (_sha256(DESTROY_PLAN_FILE), _input_fingerprints()) != snapshot:
+            print("ERROR: Terraform inputs changed while waiting for confirmation. Run destroy again.")
+            return 1
+        run_terraform("apply", "-input=false", DESTROY_PLAN_FILE)
+        # Any saved create/update plan described the old state; refuse to apply it afterwards.
+        PLAN_MANIFEST.unlink(missing_ok=True)
+        print("Terraform destroy completed.")
+        return 0
+    finally:
+        DESTROY_PLAN_FILE.unlink(missing_ok=True)
 
 
 def _check_plan_freshness():
@@ -495,13 +704,21 @@ def _check_plan_freshness():
 
 def main(argv=None):
     """Run a NexusOps command."""
-    allowed = {"validate", "generate", "plan", "show-plan", "apply", "build-image", "push-ecr", "render-k8s"}
+    allowed = {
+        "validate", "generate", "plan", "show-plan", "apply", "destroy", "build-image", "push-ecr",
+        "render-k8s", "ui",
+    }
     args = sys.argv[1:] if argv is None else argv
     command = args[0] if args else "validate"
     if len(args) > 1 or command not in allowed:
         print("Usage: python run_nexusops.py "
-              "[validate|generate|plan|show-plan|apply|build-image|push-ecr|render-k8s]")
+              "[validate|generate|plan|show-plan|apply|destroy|build-image|push-ecr|render-k8s|ui]")
         return 2
+
+    if command == "ui":
+        # Started before config validation so an invalid config can be fixed in the UI.
+        from webui.server import serve
+        return serve()
 
     try:
         config = load_config()
@@ -561,6 +778,9 @@ def main(argv=None):
             return 0
 
         generate_terraform_variables(config)
+        write_backend_config(config)
+        if command == "destroy":
+            return _destroy()
         if command == "generate":
             print("Terraform variables generated successfully.")
             return 0

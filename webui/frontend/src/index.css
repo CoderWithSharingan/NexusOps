@@ -1,0 +1,139 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+@theme inline {
+  --color-bg: var(--nx-background);
+  --color-surface: var(--nx-surface);
+  --color-line: var(--nx-border);
+  --color-primary: var(--nx-primary);
+  --color-secondary: var(--nx-secondary);
+  --color-text: var(--nx-text);
+  --color-muted: var(--nx-muted);
+  --color-ok: var(--nx-ok);
+  --color-error: var(--nx-error);
+  --color-warn: var(--nx-warn);
+  --color-idle: var(--nx-idle);
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, "Cascadia Code", monospace;
+}
+
+/* Background on html only: a body background would paint over the -z-10 scene layer. */
+html {
+  background: var(--nx-background);
+  color: var(--nx-text);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  transition: background-color 0.5s ease, color 0.5s ease;
+}
+
+body {
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--nx-primary) 40%, transparent);
+}
+
+:focus-visible {
+  outline: 2px solid var(--nx-secondary);
+  outline-offset: 3px;
+  border-radius: 10px;
+}
+
+/* In the components layer so utilities such as absolute/sticky can override position. */
+@layer components {
+  .glass {
+    position: relative;
+    background: color-mix(in srgb, var(--nx-surface) 62%, transparent);
+    border: 1px solid color-mix(in srgb, var(--nx-border) 80%, transparent);
+    box-shadow:
+      0 24px 60px -24px color-mix(in srgb, var(--nx-primary) 35%, transparent),
+      inset 0 1px 0 color-mix(in srgb, white 10%, transparent);
+    backdrop-filter: blur(18px) saturate(140%);
+    -webkit-backdrop-filter: blur(18px) saturate(140%);
+  }
+
+  .glass::before {
+    content: "";
+    position: absolute;
+    inset: -1px;
+    border-radius: inherit;
+    padding: 1px;
+    background: linear-gradient(135deg, color-mix(in srgb, var(--nx-primary) 70%, transparent), transparent 40%,
+        transparent 60%, color-mix(in srgb, var(--nx-secondary) 60%, transparent));
+    mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    mask-composite: exclude;
+    pointer-events: none;
+  }
+
+  .text-gradient {
+    background: linear-gradient(100deg, var(--nx-primary), var(--nx-secondary));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+}
+
+/* Custom cursor: native CSS cursor images never lag behind the pointer. */
+@media (pointer: fine) {
+  html.nx-cursor,
+  html.nx-cursor * {
+    cursor: url("/cursors/arrow.svg") 5 4, auto;
+  }
+
+  html.nx-cursor :is(a, button, select, summary, label[for], [role="switch"], [role="button"], [data-interactive]),
+  html.nx-cursor :is(a, button, select, summary, label[for], [role="switch"], [role="button"], [data-interactive]) * {
+    cursor: url("/cursors/arrow-hover.svg") 5 4, pointer;
+  }
+
+  html.nx-cursor :is(input:not([type="checkbox"], [type="radio"], [type="range"]), textarea, [contenteditable="true"]) {
+    cursor: text;
+  }
+
+  html.nx-cursor :is(:disabled, [aria-disabled="true"]),
+  html.nx-cursor :is(:disabled, [aria-disabled="true"]) * {
+    cursor: url("/cursors/arrow.svg") 5 4, not-allowed;
+  }
+
+  html.nx-cursor.nx-pressing,
+  html.nx-cursor.nx-pressing * {
+    cursor: url("/cursors/arrow-press.svg") 5 4, auto;
+  }
+}
+
+/* Lite mode background drift and pipeline flow. */
+@keyframes nx-drift {
+  0%, 100% { transform: translate3d(0, 0, 0) scale(1); }
+  50% { transform: translate3d(4%, -3%, 0) scale(1.08); }
+}
+
+@keyframes nx-flow {
+  to { stroke-dashoffset: -24; }
+}
+
+.nx-drift {
+  animation: nx-drift 18s ease-in-out infinite;
+}
+
+.nx-drift-slow {
+  animation: nx-drift 26s ease-in-out infinite reverse;
+}
+
+.nx-flow {
+  stroke-dasharray: 6 6;
+  animation: nx-flow 1.2s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nx-drift,
+  .nx-drift-slow,
+  .nx-flow {
+    animation: none;
+  }
+
+  html {
+    transition: none;
+  }
+}
